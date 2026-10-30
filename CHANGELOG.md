@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Ignore an optional scan-parameter schema when its records cannot fit the
+  available stream. A forward search can find an unrelated schema in files
+  without these records, which previously prevented opening otherwise readable
+  TSQ 8000 Evo files. Primary scan and peak bounds checks are unchanged.
+
 ## [3.1.0] - 2026-10-20
 
 ### Added

@@ -839,6 +839,32 @@ fn v66_body_sizes<R: Read + Seek>(
     Ok(V66BodySizes::ByLevel(body, body))
 }
 
+// Forward schema discovery can find an unrelated GenericDataHeader when a
+// file has no scan-parameter records. Only accept a schema whose records fit
+// the actual stream; scan and peak data keep their separate bounds checks.
+fn read_optional_scan_parameters<R: Read + Seek>(
+    r: &mut BinaryReader<R>,
+    header: Option<GenericDataHeader>,
+    stream_addr: u64,
+    num_scans: u32,
+) -> Result<(GenericDataHeader, Vec<GenericRecord>)> {
+    let tail = r.length()?.saturating_sub(stream_addr);
+    match header {
+        Some(hdr)
+            if (num_scans as u64).saturating_mul(hdr.fixed_record_size().max(1) as u64) <= tail =>
+        {
+            r.seek_to(stream_addr)?;
+            r.check_count(num_scans as u64, hdr.fixed_record_size().max(1) as u64)?;
+            let mut params = Vec::with_capacity(num_scans as usize);
+            for _ in 0..num_scans {
+                params.push(GenericRecord::read(r, &hdr)?);
+            }
+            Ok((hdr, params))
+        }
+        _ => Ok((GenericDataHeader { fields: Vec::new() }, Vec::new())),
+    }
+}
+
 impl RawFileReader {
     /// Open and parse a RAW file from a reader.
     pub fn open<R: Read + Seek>(source: R) -> Result<Self> {
@@ -1001,19 +1027,9 @@ impl RawFileReader {
             } else {
                 None
             };
-            match GenericDataHeader::find_forward(&mut r, scan_distance, expected_record_size)? {
-                Some(hdr) => {
-                    // Records start directly at scan_params_addr - no stream preamble.
-                    r.seek_to(run_header.scan_params_addr)?;
-                    r.check_count(num_scans as u64, hdr.fixed_record_size().max(1) as u64)?;
-                    let mut params = Vec::with_capacity(num_scans as usize);
-                    for _ in 0..num_scans {
-                        params.push(GenericRecord::read(&mut r, &hdr)?);
-                    }
-                    (hdr, params)
-                }
-                None => (GenericDataHeader { fields: Vec::new() }, Vec::new()),
-            }
+            let header =
+                GenericDataHeader::find_forward(&mut r, scan_distance, expected_record_size)?;
+            read_optional_scan_parameters(&mut r, header, run_header.scan_params_addr, num_scans)?
         } else {
             (GenericDataHeader { fields: Vec::new() }, Vec::new())
         };
@@ -3009,5 +3025,67 @@ mod counted_event_tests {
         let mut r = BinaryReader::new(Cursor::new(bytes));
         assert_eq!(counted_v66_body_sizes(&mut r, 6, end).unwrap(), None);
         assert_eq!(r.position(), 0);
+    }
+}
+
+#[cfg(test)]
+mod optional_scan_parameter_tests {
+    use super::*;
+    use crate::test_util::pascal_string;
+    use std::io::Cursor;
+
+    // A plausible unrelated schema can occur before a one-byte-per-scan
+    // tail. Exercise schema discovery and record decoding together without
+    // redistributing measurement files or reference-reader output.
+    fn stream(records: &[u8]) -> (BinaryReader<Cursor<Vec<u8>>>, u64, u64) {
+        let mut bytes = 2u32.to_le_bytes().to_vec();
+        for label in ["Scan Segment:", "Scan Event:"] {
+            bytes.extend(0x8u32.to_le_bytes()); // Int32
+            bytes.extend(0u32.to_le_bytes());
+            bytes.extend(pascal_string(label));
+        }
+        let addr = bytes.len() as u64;
+        bytes.extend(records);
+        (BinaryReader::new(Cursor::new(bytes)), addr, addr)
+    }
+
+    fn decode(records: &[u8], count: u32) -> Result<(GenericDataHeader, Vec<GenericRecord>)> {
+        let (mut r, search_len, addr) = stream(records);
+        let header = GenericDataHeader::find_forward(&mut r, search_len, None)?;
+        assert!(header.is_some(), "the unrelated schema must be found");
+        read_optional_scan_parameters(&mut r, header, addr, count)
+    }
+
+    #[test]
+    fn unrelated_schema_does_not_reject_short_optional_stream() {
+        let (header, records) = decode(&[0, 0], 2).unwrap();
+        assert!(header.fields.is_empty());
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn truncated_last_record_is_not_decoded_as_optional_parameters() {
+        let (header, records) = decode(&[0; 15], 2).unwrap();
+        assert!(header.fields.is_empty());
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn complete_records_and_trailing_padding_are_preserved() {
+        let mut bytes = Vec::new();
+        for value in [1i32, 2, 3, 4] {
+            bytes.extend(value.to_le_bytes());
+        }
+        for padding in [0, 3] {
+            let mut padded = bytes.clone();
+            padded.resize(bytes.len() + padding, 0);
+            let (header, records) = decode(&padded, 2).unwrap();
+            assert_eq!(header.fields.len(), 2);
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0].get_i32("Scan Segment:"), Some(1));
+            assert_eq!(records[0].get_i32("Scan Event:"), Some(2));
+            assert_eq!(records[1].get_i32("Scan Segment:"), Some(3));
+            assert_eq!(records[1].get_i32("Scan Event:"), Some(4));
+        }
     }
 }
