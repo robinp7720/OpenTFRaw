@@ -6,7 +6,7 @@ use std::io::{Read, Seek};
 ///
 /// Read through the accessor methods; the stored layout may change as more
 /// of the scan event is decoded.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Reaction {
     pub(crate) precursor_mz: f64,
@@ -26,7 +26,7 @@ impl Reaction {
 }
 
 /// M/z acquisition range.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct FractionCollector {
     pub(crate) low_mz: f64,
@@ -46,7 +46,7 @@ impl FractionCollector {
 }
 
 /// Scan event preamble - byte array encoding scan parameters.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ScanEventPreamble {
     pub(crate) bytes: Vec<u8>,
@@ -56,7 +56,7 @@ pub struct ScanEventPreamble {
 ///
 /// Read through the accessor methods; the stored layout may change as more
 /// of the scan event is decoded.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ScanEvent {
     pub(crate) preamble: ScanEventPreamble,
@@ -129,6 +129,10 @@ impl ScanEventPreamble {
     pub(crate) fn size_for_version(version: u32) -> usize {
         match version {
             0..=8 => 41,
+            // Single-quadrupole GC-MS (Xcalibur file version 47): byte 4 is
+            // polarity, 5 scan mode, 6 MS power and 7 scan type, as in later
+            // layouts.
+            47 => 32,
             57 | 60 => 80,
             62 => 120,
             63 | 64 => 128,

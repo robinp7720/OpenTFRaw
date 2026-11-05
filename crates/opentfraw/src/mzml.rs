@@ -420,7 +420,7 @@ fn resolve_scan_arrays<R: Read + Seek>(
     event: Option<&ScanEvent>,
     nominal_scan_mode: Option<crate::ScanMode>,
 ) -> Result<ScanArrays> {
-    if include_profile && !raw.flat_peaks {
+    if include_profile && raw.scan_format == crate::ScanDataFormat::PacketHeader {
         let packet = raw.read_scan(source, scan_number)?;
         if let Some(profile) = packet.profile {
             let coeffs = event.map(|e| e.coefficients.as_slice()).unwrap_or(&[]);
