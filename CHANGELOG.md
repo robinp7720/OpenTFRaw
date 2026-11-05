@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Open Xcalibur file version 47 (single-quadrupole GC-MS full scans). The
+  sequence row carries the trailing text fields known from version 57, and
+  scan-event templates follow the error log. Scans use the new `PackedV47`
+  format: 5-byte centroids with a base-4 intensity exponent, calibrated by
+  the event's polynomial. Previously the misaligned header made the reader
+  reject the file with an allocation error.
 - Ignore an optional scan-parameter schema when its records cannot fit the
   available stream. A forward search can find an unrelated schema in files
   without these records, which previously prevented opening otherwise readable

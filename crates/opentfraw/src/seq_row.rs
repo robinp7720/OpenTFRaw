@@ -68,7 +68,9 @@ impl SeqRow {
         let path = r.read_pascal_string()?;
         let vial = r.read_pascal_string()?;
 
-        if version >= 57 {
+        // Present from at least file version 47 (an Xcalibur v47 GC-MS file
+        // stores "", "Not Supported" and 0 here); absent in older layouts.
+        if version >= 47 {
             // unk_c, unk_d
             let _unk_c = r.read_pascal_string()?;
             let _unk_d = r.read_pascal_string()?;
@@ -93,5 +95,56 @@ impl SeqRow {
             path,
             vial,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::{pascal_string, utf16_fixed};
+    use std::io::Cursor;
+
+    fn seq_row_bytes(trailer: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&utf16_fixed("", 12));
+        for v in [10.0f64, 0.0, 0.0, 0.0, 1.0] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        for s in [
+            "",
+            "",
+            "1",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "m.meth",
+            "",
+            "run.RAW",
+            "D:\\data\\",
+            "1",
+        ] {
+            b.extend_from_slice(&pascal_string(s));
+        }
+        b.extend_from_slice(trailer);
+        b
+    }
+
+    #[test]
+    fn version_47_reads_the_trailing_text_fields() {
+        let mut trailer = pascal_string("");
+        trailer.extend_from_slice(&pascal_string("Not Supported"));
+        trailer.extend_from_slice(&0u32.to_le_bytes());
+        let bytes = seq_row_bytes(&trailer);
+        let len = bytes.len() as u64;
+        let mut r = BinaryReader::new(Cursor::new(bytes));
+        let row = SeqRow::read(&mut r, 47).unwrap();
+        assert_eq!(row.file_name, "run.RAW");
+        assert_eq!(r.position(), len);
     }
 }

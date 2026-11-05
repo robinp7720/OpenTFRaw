@@ -8,7 +8,8 @@ use crate::header::FileHeader;
 use crate::raw_file_info::RawFileInfo;
 use crate::run_header::RunHeader;
 use crate::scan_data::{
-    read_flat_peaks, read_scan_srm_v66, search_v63_transition, Peak, ScanDataPacket,
+    read_flat_peaks, read_packed_v47_peaks, read_scan_srm_v66, search_v63_transition, Peak,
+    ScanDataPacket,
 };
 use crate::scan_event::{ScanEvent, ScanEventPreamble};
 use crate::scan_index::ScanIndexEntry;
@@ -865,6 +866,35 @@ fn read_optional_scan_parameters<R: Read + Seek>(
     }
 }
 
+// Scan-event templates of a version 47 file, grouped by segment (see
+// `RawFileReader::open`). The reader must be positioned after the error log.
+fn read_legacy_event_templates<R: Read + Seek>(
+    r: &mut BinaryReader<R>,
+    version: u32,
+    nsegs: u32,
+) -> Result<Vec<Vec<ScanEvent>>> {
+    let preamble = ScanEventPreamble::size_for_version(version) as u64;
+    let _reserved = r.read_u32()?;
+    let segments = r.read_u32()?;
+    if segments != nsegs {
+        return Err(Error::UnsupportedOperation(
+            "scan-event segment count does not match the run header",
+        ));
+    }
+    r.check_count(segments as u64, 4)?;
+    let mut templates = Vec::with_capacity(segments as usize);
+    for _ in 0..segments {
+        let n = r.read_u32()?;
+        r.check_count(n as u64, preamble)?;
+        let mut events = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            events.push(ScanEvent::read(r, version, 0, 0)?);
+        }
+        templates.push(events);
+    }
+    Ok(templates)
+}
+
 impl RawFileReader {
     /// Open and parse a RAW file from a reader.
     pub fn open<R: Read + Seek>(source: R) -> Result<Self> {
@@ -1003,6 +1033,26 @@ impl RawFileReader {
         // through megabytes of binary scan data.
         let after_error_log = r.position();
 
+        // Version 47 has no per-scan trailer. Its scan-event templates follow
+        // the error log as: u32 (0), u32 segment count, then per segment a
+        // u32 event count and the events. Each scan uses the template named
+        // by its index entry; the templates carry the m/z calibration.
+        if version == 47 && scan_events.is_empty() {
+            if let Ok(templates) = read_legacy_event_templates(&mut r, version, run_header.nsegs) {
+                scan_events = scan_index
+                    .iter()
+                    .map(|e| {
+                        templates
+                            .get(e.scan_segment as usize)
+                            .and_then(|seg| seg.get(e.scan_event as usize))
+                            .cloned()
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .unwrap_or_default();
+            }
+            r.seek_to(after_error_log)?;
+        }
+
         // 10. Scan parameters (trailer extra) - GenericData format in v64+.
         //     The schema (GDH) is written just after the error-log entries;
         //     the records are written at `scan_params_addr` (tail of file)
@@ -1077,6 +1127,7 @@ impl RawFileReader {
 
         // Classify scan format and device family.
         let scan_format = crate::scan_format::ScanDataFormat::detect(version, flat_peaks);
+        let flat_peaks = scan_format.is_flat();
         let first_analyzer = scan_events.first().and_then(|e| e.preamble.analyzer());
 
         // For SRM (flat-peak) files, read the entire pre-scan-data region so that
@@ -1399,6 +1450,30 @@ impl RawFileReader {
         read_scan_srm_v66(source, self.data_addr, entry.offset, entry.data_size)
     }
 
+    /// Read a single scan in the packed centroid format of file version 47,
+    /// calibrated with the scan's event template.
+    pub fn read_scan_packed_v47<R: Read + Seek>(
+        &self,
+        source: &mut R,
+        scan_number: u32,
+    ) -> Result<Vec<Peak>> {
+        let entry = self.scan_index_entry(scan_number)?;
+        let idx = scan_number_to_index(scan_number, self.run_header.sample_info.first_scan_number)
+            .ok_or(Error::AddressOutOfRange(scan_number as u64))?;
+        let coefficients = self
+            .scan_events
+            .get(idx)
+            .map(|e| e.coefficients.as_slice())
+            .unwrap_or(&[]);
+        read_packed_v47_peaks(
+            source,
+            self.data_addr,
+            entry.offset,
+            entry.data_size,
+            coefficients,
+        )
+    }
+
     /// Read a single scan's peaks using whichever decoder matches this file's
     /// scan-data format.
     ///
@@ -1423,6 +1498,7 @@ impl RawFileReader {
             }
             ScanDataFormat::FlatV63 => self.read_scan_flat(source, scan_number),
             ScanDataFormat::FlatV66 => self.read_scan_srm_v66(source, scan_number),
+            ScanDataFormat::PackedV47 => self.read_scan_packed_v47(source, scan_number),
         }
     }
 
@@ -1453,6 +1529,7 @@ impl RawFileReader {
             }
             ScanDataFormat::FlatV63 => self.read_scan_flat(source, scan_number),
             ScanDataFormat::FlatV66 => self.read_scan_srm_v66(source, scan_number),
+            ScanDataFormat::PackedV47 => self.read_scan_packed_v47(source, scan_number),
         }
     }
 

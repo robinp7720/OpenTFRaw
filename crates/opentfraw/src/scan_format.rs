@@ -12,6 +12,7 @@
 //! | `PacketHeader`   | 57, 63, 64, 66 | Orbitrap / ion trap / Q-Orbitrap | Variable, self-describing |
 //! | `FlatV63`        | 63            | TSQ Vantage (SRM)        | Variable; offset = cumulative end |
 //! | `FlatV66`        | 64, 66        | TSQ Quantiva / Altis (SRM) | Fixed size; offset = start, header+windows+peaks |
+//! | `PackedV47`      | 47            | Single-quadrupole GC-MS (full scan) | 5 bytes per centroid; offset = start |
 
 /// The scan-data encoding used by a RAW file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,18 @@ pub enum ScanDataFormat {
     /// - bytes 32..32+8·n: m/z window table (2 × f32 per channel)
     /// - bytes 32+8·n..: peak triplets `(u32 channel, f32 mz, f32 intensity)`
     FlatV66,
+
+    /// Packed centroids written by Xcalibur file version 47 (single-quadrupole
+    /// GC-MS full scans). Offsets are start positions and `data_size` is the
+    /// peak count, padded to an even number with an all-zero peak.
+    ///
+    /// Peaks are stored in pairs as `u16 intensity[2]` then `u24 position[2]`
+    /// (a final unpaired peak is `u16` then `u24`). Intensity is a 13-bit
+    /// mantissa with a 3-bit base-4 exponent in the low bits:
+    /// `(raw >> 3) << (2 * (raw & 7))`. The position is m/z × 1024 before
+    /// calibration; m/z is the scan event's calibration polynomial evaluated
+    /// at `position / 1024` (coefficients in ascending order).
+    PackedV47,
 }
 
 impl ScanDataFormat {
@@ -45,6 +58,9 @@ impl ScanDataFormat {
     /// it is `true` when the RunHeader has no scan-event trailer, which is the
     /// signature of a triple-quadrupole SRM acquisition.
     pub fn detect(version: u32, flat_peaks: bool) -> Self {
+        if version == 47 {
+            return Self::PackedV47;
+        }
         if !flat_peaks {
             return Self::PacketHeader;
         }
@@ -57,7 +73,7 @@ impl ScanDataFormat {
 
     /// Whether this format uses the flat (SRM) peak layout.
     pub fn is_flat(self) -> bool {
-        !matches!(self, Self::PacketHeader)
+        matches!(self, Self::FlatV63 | Self::FlatV66)
     }
 
     /// Human-readable name suitable for logging.
@@ -66,6 +82,7 @@ impl ScanDataFormat {
             Self::PacketHeader => "PacketHeader",
             Self::FlatV63 => "FlatV63 (TSQ Vantage SRM)",
             Self::FlatV66 => "FlatV66 (TSQ Quantiva/Altis SRM)",
+            Self::PackedV47 => "PackedV47 (legacy GC-MS full scan)",
         }
     }
 }

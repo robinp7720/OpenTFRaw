@@ -494,6 +494,46 @@ pub(crate) fn read_flat_peaks<R: Read + Seek>(
     })
 }
 
+/// Read a packed centroid scan written by Xcalibur file version 47.
+///
+/// `offset` is the record's start within the data stream and `data_size` the
+/// stored peak count. See [`crate::ScanDataFormat::PackedV47`] for the layout.
+/// All-zero padding peaks are skipped. `coefficients` is the scan event's
+/// calibration polynomial in ascending order; it must not be empty.
+pub(crate) fn read_packed_v47_peaks<R: Read + Seek>(
+    source: &mut R,
+    data_addr: u64,
+    offset: u64,
+    data_size: u32,
+    coefficients: &[f64],
+) -> Result<Vec<Peak>> {
+    let start = data_addr.saturating_add(offset);
+    if coefficients.is_empty() || coefficients.iter().any(|c| !c.is_finite()) {
+        return Err(Error::UnrecognizedScanRecord { offset: start });
+    }
+    source.seek(SeekFrom::Start(start))?;
+    let mut r = BinaryReader::new(&mut *source);
+    r.check_count(data_size as u64, 5)?;
+    let bytes = r.read_bytes(data_size as usize * 5)?;
+    let mut peaks = Vec::with_capacity(data_size as usize);
+    for group in bytes.chunks(10) {
+        let n = group.len() / 5;
+        for j in 0..n {
+            let raw_int = u16::from_le_bytes([group[2 * j], group[2 * j + 1]]);
+            let p = 2 * n + 3 * j;
+            let position = u32::from_le_bytes([group[p], group[p + 1], group[p + 2], 0]);
+            if raw_int == 0 && position == 0 {
+                continue;
+            }
+            let x = position as f64 / 1024.0;
+            let mz = coefficients.iter().rev().fold(0.0, |acc, c| acc * x + c);
+            let abundance = ((raw_int as u32 >> 3) << (2 * (raw_int as u32 & 7))) as f32;
+            peaks.push(Peak { mz, abundance });
+        }
+    }
+    Ok(peaks)
+}
+
 /// Read a flat-peak scan in v66 (TSQ Quantiva / TSQ Altis) SRM format.
 ///
 /// In this format, the scan data stream contains fixed-size records.
@@ -976,6 +1016,60 @@ mod tests {
             ScanDataPacket::read_peaks(&mut r, &header).unwrap().len(),
             0
         );
+    }
+
+    #[test]
+    fn read_packed_v47_peaks_decodes_pairs_exponents_and_padding() {
+        // Two peaks, then one real peak padded by an all-zero peak.
+        let mut data = vec![0xAA; 3];
+        let ints: [u16; 3] = [120 << 3, (2429 << 3) | 2, 2 << 3];
+        let pos: [u32; 3] = [42_591, 211_755, 378_839];
+        data.extend_from_slice(&ints[0].to_le_bytes());
+        data.extend_from_slice(&ints[1].to_le_bytes());
+        data.extend_from_slice(&pos[0].to_le_bytes()[..3]);
+        data.extend_from_slice(&pos[1].to_le_bytes()[..3]);
+        data.extend_from_slice(&ints[2].to_le_bytes());
+        data.extend_from_slice(&[0, 0]);
+        data.extend_from_slice(&pos[2].to_le_bytes()[..3]);
+        data.extend_from_slice(&[0, 0, 0]);
+        // Calibration recorded in a v47 GC-MS file; the expected m/z values
+        // are the base-peak masses Xcalibur stored in its scan index.
+        let coefficients = [
+            0.9909513130836409,
+            0.9982048129599381,
+            -3.346147355956731e-06,
+            3.5102956139594947e-09,
+        ];
+        let mut cursor = Cursor::new(data);
+        let peaks = read_packed_v47_peaks(&mut cursor, 3, 0, 4, &coefficients).unwrap();
+        assert_eq!(peaks.len(), 3);
+        assert_eq!(peaks[0].abundance, 120.0);
+        assert_eq!(peaks[1].abundance, 38_864.0);
+        assert_eq!(peaks[2].abundance, 2.0);
+        for (peak, expected) in
+            peaks
+                .iter()
+                .zip([42.50352182473063, 207.299663790863, 370.0065257741866])
+        {
+            assert!(
+                (peak.mz - expected).abs() < 1e-9,
+                "{} != {expected}",
+                peak.mz
+            );
+        }
+    }
+
+    #[test]
+    fn read_packed_v47_peaks_requires_calibration_and_bounded_count() {
+        let mut cursor = Cursor::new(vec![0u8; 10]);
+        assert!(matches!(
+            read_packed_v47_peaks(&mut cursor, 0, 0, 2, &[]),
+            Err(Error::UnrecognizedScanRecord { .. })
+        ));
+        assert!(matches!(
+            read_packed_v47_peaks(&mut cursor, 0, 0, 3, &[0.0, 1.0]),
+            Err(Error::AllocationTooLarge { .. })
+        ));
     }
 
     #[test]
